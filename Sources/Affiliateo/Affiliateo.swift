@@ -94,12 +94,7 @@ public final class AffiliateoManager: ObservableObject {
             name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appDidEnterBackground),
-            name: UIApplication.didEnterBackgroundNotification,
-            object: nil
-        )
+        // No background observer — server handles inactivity via 10-minute timeout
         #endif
     }
 
@@ -158,16 +153,6 @@ public final class AffiliateoManager: ObservableObject {
                 campaignId: campaignId,
                 deviceId: deviceId,
                 events: [MobileEvent(type: .sessionStart)]
-            )
-        }
-    }
-
-    @objc private func appDidEnterBackground() {
-        Task {
-            try? await client.sendEvents(
-                campaignId: campaignId,
-                deviceId: deviceId,
-                events: [MobileEvent(type: .sessionEnd)]
             )
         }
     }
