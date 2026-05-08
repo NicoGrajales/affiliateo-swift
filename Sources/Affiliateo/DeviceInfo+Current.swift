@@ -29,7 +29,7 @@ extension DeviceInfo {
             screenWidth: screenWidth,
             screenHeight: screenHeight,
             timezone: TimeZone.current.identifier,
-            language: Locale.current.language.languageCode?.identifier ?? "en"
+            language: Locale.current.languageCode ?? "en"
         )
     }
 }
