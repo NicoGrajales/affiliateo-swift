@@ -152,12 +152,37 @@ public final class AffiliateoManager: ObservableObject {
                 deviceInfo: deviceInfo
             )
 
+            // Apple native IAP attribution. Mint a stable UUID per
+            // (campaignId, refCode) so the customer's purchase chain (initial
+            // buy + every renewal + refund) all carry the same token Apple
+            // stamped at first purchase. Customer's purchase code reads it
+            // via state.appAccountToken and passes it as
+            // .appAccountToken(uuid) to StoreKit 2's product.purchase(options:).
+            //
+            // Best-effort: registration failure here means the next launch
+            // retries (the backend dedups via mobile_app_visitors unique
+            // constraint).
+            var appleToken: UUID? = nil
+            if let refCode = result.refCode {
+                appleToken = Affiliateo.getOrMintAppleAccountToken(campaignId: campaignId, refCode: refCode)
+                if let token = appleToken {
+                    Task {
+                        try? await client.registerAppleToken(
+                            campaignId: campaignId,
+                            visitorId: result.visitorId,
+                            token: token
+                        )
+                    }
+                }
+            }
+
             await MainActor.run {
                 self.state = AffiliateoState(
                     refCode: result.refCode,
                     isMatched: result.matched,
                     isLoading: false,
-                    visitorId: result.visitorId
+                    visitorId: result.visitorId,
+                    appAccountToken: appleToken
                 )
             }
 
@@ -171,10 +196,26 @@ public final class AffiliateoManager: ObservableObject {
                     refCode: nil,
                     isMatched: false,
                     isLoading: false,
-                    visitorId: nil
+                    visitorId: nil,
+                    appAccountToken: nil
                 )
             }
         }
+    }
+
+    /// Get or mint a stable StoreKit 2 appAccountToken for this affiliate match.
+    /// Persisted in UserDefaults keyed by (campaignId, refCode) so the same UUID
+    /// is reused across app launches for the same affiliate (binding the whole
+    /// purchase chain to one affiliate).
+    private static func getOrMintAppleAccountToken(campaignId: String, refCode: String) -> UUID {
+        let key = "affiliateo_apple_token:\(campaignId):\(refCode)"
+        if let existing = UserDefaults.standard.string(forKey: key),
+           let uuid = UUID(uuidString: existing) {
+            return uuid
+        }
+        let fresh = UUID()
+        UserDefaults.standard.set(fresh.uuidString, forKey: key)
+        return fresh
     }
 
     private func setRevenueCatAttribute(refCode: String) {

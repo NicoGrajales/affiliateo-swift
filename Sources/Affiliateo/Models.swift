@@ -55,11 +55,13 @@ public struct MobileEvent {
 public enum AffiliateoError: Error, LocalizedError {
     case identifyFailed
     case eventSendFailed
+    case appleTokenRegisterFailed
 
     public var errorDescription: String? {
         switch self {
         case .identifyFailed: return "Failed to identify device with Affiliateo."
         case .eventSendFailed: return "Failed to send events to Affiliateo."
+        case .appleTokenRegisterFailed: return "Failed to register Apple appAccountToken with Affiliateo."
         }
     }
 }
@@ -70,4 +72,31 @@ public struct AffiliateoState {
     public let isMatched: Bool
     public let isLoading: Bool
     public let visitorId: String?
+    /// StoreKit 2 appAccountToken UUID. Pass this to your StoreKit 2 purchase
+    /// call so Apple stamps it onto the transaction and our webhook can
+    /// resolve it back to the affiliate.
+    ///
+    /// ```swift
+    /// let token = affiliateo.state.appAccountToken
+    /// let opts: Set<Product.PurchaseOption> = token.map { [.appAccountToken($0)] } ?? []
+    /// let result = try await product.purchase(options: opts)
+    /// ```
+    ///
+    /// Nil before identify completes, when the device isn't matched to any
+    /// affiliate, or on platforms other than iOS / macCatalyst.
+    public let appAccountToken: UUID?
+
+    public init(
+        refCode: String?,
+        isMatched: Bool,
+        isLoading: Bool,
+        visitorId: String?,
+        appAccountToken: UUID? = nil
+    ) {
+        self.refCode = refCode
+        self.isMatched = isMatched
+        self.isLoading = isLoading
+        self.visitorId = visitorId
+        self.appAccountToken = appAccountToken
+    }
 }

@@ -73,4 +73,33 @@ final class AffiliateoClient {
             throw AffiliateoError.eventSendFailed
         }
     }
+
+    /// Bind a StoreKit 2 appAccountToken to this visitor on the server. After
+    /// this returns, Apple notifications carrying this UUID in
+    /// signedTransactionInfo.appAccountToken resolve to the same affiliate
+    /// the visitor is matched to.
+    func registerAppleToken(campaignId: String, visitorId: String, token: UUID) async throws {
+        let url = URL(string: "\(apiUrl)/api/v1/mobile/apple-token")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        // Apple's appAccountToken serializes to lowercase UUID by convention.
+        let body: [String: Any] = [
+            "campaign_id": campaignId,
+            "visitor_id": visitorId,
+            "token": token.uuidString.lowercased(),
+        ]
+
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+
+        // Best-effort: a 4xx here means the visitor isn't bindable (e.g.
+        // campaign doesn't have Apple connected yet). Treat as non-fatal —
+        // the caller still gets the local token and can retry next launch.
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw AffiliateoError.appleTokenRegisterFailed
+        }
+    }
 }
