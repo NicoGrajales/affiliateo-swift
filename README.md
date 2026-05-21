@@ -7,7 +7,7 @@ Mobile affiliate attribution and session tracking for iOS apps (SwiftUI & UIKit)
 In Xcode: **File → Add Package Dependencies** → paste this URL:
 
 ```
-https://github.com/RealNicoGS/affiliateo-swift
+https://github.com/affiliateo/affiliateo-swift
 ```
 
 ## Usage (SwiftUI)
@@ -44,12 +44,39 @@ struct ContentView: View {
 }
 ```
 
+## Track screens (manual)
+
+Screens are tracked when you call `Affiliateo.page(name)` per screen. This matches the Mixpanel / Amplitude / Datafast model. predictable, no ghost events polluting funnels.
+
+```swift
+struct HomeScreen: View {
+    var body: some View {
+        YourScreenUI()
+            .onAppear {
+                Affiliateo.page("HomeScreen")
+            }
+    }
+}
+```
+
+## Track custom events
+
+For buttons or other moments that matter (signup, trial start, etc.):
+
+```swift
+Button("Continue") {
+    Affiliateo.track("signup_completed")
+    onNext()
+}
+```
+
 ## What it does
 
 - **Identifies the device** using Apple's built-in IDFV (no permissions needed)
-- **Tracks sessions** automatically (app open / app close)
+- **Tracks sessions** automatically (app foreground)
 - **Matches affiliate referrals** via fingerprint matching
 - **Sets RevenueCat attributes** automatically if RevenueCat is installed
+- **IAP attribution** via StoreKit 2 `appAccountToken`
 
 ## Requirements
 
