@@ -45,9 +45,14 @@ final class EventQueue {
 
     private let storageKey = "affiliateo_event_queue"
     private let maxRetries = 3
-    private let maxQueueSize = 100
-    private let flushIntervalSecs: TimeInterval = 5
     private let sizeFlushThreshold = 10
+    // Configurable via init(flushIntervalSecs:maxQueueSize:). Defaults
+    // match the rest of the SDK family (web, RN, Kotlin, Flutter).
+    // Bounded inputs in the init guard against pathological values
+    // (refuse <1s flush so we don't hammer the network, refuse >60s so
+    // the queue actually drains; min 10 / max 1000 on size cap).
+    private let maxQueueSize: Int
+    private let flushIntervalSecs: TimeInterval
 
     private let userDefaults: UserDefaults
     private var queue: [QueuedEvent] = []
@@ -68,8 +73,15 @@ final class EventQueue {
     // every field, which is more error-prone.
     private let serialQueue = DispatchQueue(label: "com.affiliateo.queue")
 
-    init(userDefaults: UserDefaults = .standard) {
+    init(
+        userDefaults: UserDefaults = .standard,
+        flushIntervalSecs: TimeInterval = 5,
+        maxQueueSize: Int = 100
+    ) {
         self.userDefaults = userDefaults
+        // Clamp to sane bounds so a misconfigured host can't break the queue.
+        self.flushIntervalSecs = max(1, min(60, flushIntervalSecs))
+        self.maxQueueSize = max(10, min(1000, maxQueueSize))
         loadFromDisk()
         startNetworkMonitor()
         startFlushTimer()

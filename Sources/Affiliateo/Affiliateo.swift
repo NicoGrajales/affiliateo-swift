@@ -30,6 +30,8 @@ public struct AffiliateoProvider<Content: View>: View {
         campaignId: String,
         apiUrl: String = "https://affiliateo.com",
         debug: Bool = false,
+        flushIntervalSecs: TimeInterval = 5,
+        maxQueueSize: Int = 100,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.campaignId = campaignId
@@ -38,7 +40,9 @@ public struct AffiliateoProvider<Content: View>: View {
         _manager = StateObject(wrappedValue: AffiliateoManager(
             campaignId: campaignId,
             apiUrl: apiUrl,
-            debug: debug
+            debug: debug,
+            flushIntervalSecs: flushIntervalSecs,
+            maxQueueSize: maxQueueSize
         ))
     }
 
@@ -104,13 +108,20 @@ public final class AffiliateoManager: ObservableObject {
     public init(
         campaignId: String,
         apiUrl: String = "https://affiliateo.com",
-        debug: Bool = false
+        debug: Bool = false,
+        flushIntervalSecs: TimeInterval = 5,
+        maxQueueSize: Int = 100
     ) {
         self.campaignId = campaignId
         self.apiUrl = apiUrl.hasSuffix("/") ? String(apiUrl.dropLast()) : apiUrl
         self.client = AffiliateoClient(apiUrl: apiUrl)
         self.deviceId = getStableDeviceId()
-        self.queue = EventQueue()
+        // Queue tuning. Both clamped inside EventQueue.init so a host
+        // passing 0 or 999999 won't break us.
+        self.queue = EventQueue(
+            flushIntervalSecs: flushIntervalSecs,
+            maxQueueSize: maxQueueSize
+        )
         self.isOptedOut = UserDefaults.standard.string(forKey: AffiliateoManager.optOutKey) == "true"
         self.debug = debug
         AffiliateoManager.shared = self
