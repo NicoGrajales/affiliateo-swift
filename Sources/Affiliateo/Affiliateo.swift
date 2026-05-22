@@ -29,12 +29,17 @@ public struct AffiliateoProvider<Content: View>: View {
     public init(
         campaignId: String,
         apiUrl: String = "https://affiliateo.com",
+        debug: Bool = false,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.campaignId = campaignId
         self.apiUrl = apiUrl
         self.content = content
-        _manager = StateObject(wrappedValue: AffiliateoManager(campaignId: campaignId, apiUrl: apiUrl))
+        _manager = StateObject(wrappedValue: AffiliateoManager(
+            campaignId: campaignId,
+            apiUrl: apiUrl,
+            debug: debug
+        ))
     }
 
     public var body: some View {
@@ -88,15 +93,40 @@ public final class AffiliateoManager: ObservableObject {
     // inside every track/page/identify call; refreshed on optOut/optIn
     // calls so a mid-session decision applies immediately.
     private var isOptedOut: Bool
+    // Debug flag. When true, every SDK decision (init, page, track,
+    // identify, flush, opt in/out, reset) is printed to the Xcode console
+    // via print(). Only useful during development. ship with debug=false
+    // (the default) so production apps don't pay the print overhead AND
+    // don't leak SDK internals to anyone running their app under a
+    // debugger. Mirrors @affiliateo/web and @affiliateo/react-native.
+    private let debug: Bool
 
-    public init(campaignId: String, apiUrl: String = "https://affiliateo.com") {
+    public init(
+        campaignId: String,
+        apiUrl: String = "https://affiliateo.com",
+        debug: Bool = false
+    ) {
         self.campaignId = campaignId
         self.apiUrl = apiUrl.hasSuffix("/") ? String(apiUrl.dropLast()) : apiUrl
         self.client = AffiliateoClient(apiUrl: apiUrl)
         self.deviceId = getStableDeviceId()
         self.queue = EventQueue()
         self.isOptedOut = UserDefaults.standard.string(forKey: AffiliateoManager.optOutKey) == "true"
+        self.debug = debug
         AffiliateoManager.shared = self
+    }
+
+    /// Internal debug logger. No-op unless `debug: true` was passed to init.
+    /// Single-arg form for messages without payload; two-arg form for
+    /// messages with structured data. Output goes to the standard Xcode
+    /// console (visible in DevTools / debug navigator while attached).
+    private func log(_ msg: String, _ data: Any? = nil) {
+        guard debug else { return }
+        if let data = data {
+            print("[Affiliateo] \(msg)", data)
+        } else {
+            print("[Affiliateo] \(msg)")
+        }
     }
 
     /// Start tracking. Called automatically by AffiliateoProvider.
@@ -114,6 +144,7 @@ public final class AffiliateoManager: ObservableObject {
         // unblocks immediately. Public methods still exist and noop
         // until optIn() flips the flag back.
         if isOptedOut {
+            log("blocked: opted out (call optIn() to re-enable)")
             self.state = AffiliateoState(
                 refCode: nil,
                 isMatched: false,
@@ -124,6 +155,7 @@ public final class AffiliateoManager: ObservableObject {
             return
         }
 
+        log("init", ["campaign": campaignId, "device": deviceId])
         Task {
             await identify()
         }
@@ -146,6 +178,7 @@ public final class AffiliateoManager: ObservableObject {
     /// Call from `onAppear` in SwiftUI or `viewDidAppear` in UIKit.
     public func page(_ screenName: String, metadata: [String: Any]? = nil) {
         if isOptedOut { return }
+        log("page", ["screen": screenName, "metadata": metadata as Any])
         // Build the wire payload here (instead of via client.sendEvents)
         // so we can enqueue it for retry. The endpoint + body shape match
         // what client.sendEvents would have sent.
@@ -168,6 +201,7 @@ public final class AffiliateoManager: ObservableObject {
     /// Fire a custom event with arbitrary name + metadata.
     public func track(_ eventName: String, metadata: [String: Any]? = nil) {
         if isOptedOut { return }
+        log("track", ["event": eventName, "metadata": metadata as Any])
         var merged: [String: Any] = ["event": eventName]
         if let metadata = metadata {
             for (k, v) in metadata { merged[k] = v }
@@ -194,6 +228,7 @@ public final class AffiliateoManager: ObservableObject {
     /// (shared family iPad, kiosk app). Without this, the next user's
     /// actions get merged into the previous user's funnel.
     public func reset() {
+        log("reset")
         Task {
             await queue.flush()
             queue.clear()
@@ -226,6 +261,7 @@ public final class AffiliateoManager: ObservableObject {
     /// no, sending events captured before the decision would still
     /// violate consent. Use for GDPR/CCPA "Don't track me" consent.
     public func optOut() {
+        log("optOut")
         isOptedOut = true
         UserDefaults.standard.set("true", forKey: AffiliateoManager.optOutKey)
         queue.clear()
@@ -236,6 +272,7 @@ public final class AffiliateoManager: ObservableObject {
     /// to resume immediately the host should reinitialize the manager
     /// (e.g. tear down and re-create AffiliateoProvider).
     public func optIn() {
+        log("optIn")
         isOptedOut = false
         UserDefaults.standard.removeObject(forKey: AffiliateoManager.optOutKey)
     }
@@ -246,6 +283,7 @@ public final class AffiliateoManager: ObservableObject {
     /// offline the flush noops and events stay queued for the next
     /// retry cycle.
     public func flush() async {
+        log("flush requested")
         await queue.flush()
     }
 
@@ -260,6 +298,7 @@ public final class AffiliateoManager: ObservableObject {
     public func identify(_ userId: String) {
         let cleanId = userId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanId.isEmpty, cleanId.count <= 128 else { return }
+        log("identify (user)", ["user_id": cleanId])
         Task {
             try? await client.identifyUser(
                 campaignId: campaignId,
@@ -311,12 +350,18 @@ public final class AffiliateoManager: ObservableObject {
                     appAccountToken: appleToken
                 )
             }
+            log("identify success", [
+                "visitor": result.visitorId,
+                "matched": result.matched,
+                "ref": result.refCode as Any,
+            ])
 
             // Auto-set RevenueCat attribute if matched
             if let refCode = result.refCode {
                 setRevenueCatAttribute(refCode: refCode)
             }
         } catch {
+            log("identify failed (network error)")
             await MainActor.run {
                 self.state = AffiliateoState(
                     refCode: nil,
