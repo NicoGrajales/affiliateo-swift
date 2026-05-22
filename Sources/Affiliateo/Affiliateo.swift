@@ -70,15 +70,32 @@ public final class AffiliateoManager: ObservableObject {
     /// threading an `@EnvironmentObject` through every view.
     public internal(set) static weak var shared: AffiliateoManager?
 
+    // Persistent opt-out flag. Mirrors @affiliateo/react-native 4.0.0 +
+    // @affiliateo/web 3.0.0 behavior. When set to "true" the SDK silently
+    // noops every outbound call until optIn() flips it. Stored in
+    // UserDefaults so the flag survives app restarts; the
+    // `@objc dynamic var` form isn't needed here because we only ever
+    // read/write through the SDK's own methods.
+    private static let optOutKey = "affiliateo_opt_out"
+
     private let campaignId: String
+    private let apiUrl: String
     private let client: AffiliateoClient
-    private let deviceId: String
+    private var deviceId: String
+    private let queue: EventQueue
     private var started = false
+    // In-memory mirror of the on-disk opt-out flag. Hot-path check
+    // inside every track/page/identify call; refreshed on optOut/optIn
+    // calls so a mid-session decision applies immediately.
+    private var isOptedOut: Bool
 
     public init(campaignId: String, apiUrl: String = "https://affiliateo.com") {
         self.campaignId = campaignId
+        self.apiUrl = apiUrl.hasSuffix("/") ? String(apiUrl.dropLast()) : apiUrl
         self.client = AffiliateoClient(apiUrl: apiUrl)
         self.deviceId = getStableDeviceId()
+        self.queue = EventQueue()
+        self.isOptedOut = UserDefaults.standard.string(forKey: AffiliateoManager.optOutKey) == "true"
         AffiliateoManager.shared = self
     }
 
@@ -90,6 +107,22 @@ public final class AffiliateoManager: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+
+        // Opted-out fast path. Skip identify + foreground ping entirely.
+        // The state is published with isLoading=false so any host UI
+        // gated on it (e.g. a paywall waiting for the matched? check)
+        // unblocks immediately. Public methods still exist and noop
+        // until optIn() flips the flag back.
+        if isOptedOut {
+            self.state = AffiliateoState(
+                refCode: nil,
+                isMatched: false,
+                isLoading: false,
+                visitorId: nil,
+                appAccountToken: nil
+            )
+            return
+        }
 
         Task {
             await identify()
@@ -112,22 +145,108 @@ public final class AffiliateoManager: ObservableObject {
     /// Fire a screen_view event for a specific screen.
     /// Call from `onAppear` in SwiftUI or `viewDidAppear` in UIKit.
     public func page(_ screenName: String, metadata: [String: Any]? = nil) {
-        Task { await sendScreenView(screen: screenName, metadata: metadata) }
+        if isOptedOut { return }
+        // Build the wire payload here (instead of via client.sendEvents)
+        // so we can enqueue it for retry. The endpoint + body shape match
+        // what client.sendEvents would have sent.
+        var event: [String: Any] = [
+            "type": EventType.screenView.rawValue,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "screen": screenName,
+        ]
+        if let metadata = metadata { event["metadata"] = metadata }
+        queue.enqueue(
+            endpoint: "\(apiUrl)/api/v1/mobile/event",
+            payload: [
+                "campaign_id": campaignId,
+                "device_id": deviceId,
+                "events": [event],
+            ]
+        )
     }
 
     /// Fire a custom event with arbitrary name + metadata.
     public func track(_ eventName: String, metadata: [String: Any]? = nil) {
+        if isOptedOut { return }
         var merged: [String: Any] = ["event": eventName]
         if let metadata = metadata {
             for (k, v) in metadata { merged[k] = v }
         }
+        let event: [String: Any] = [
+            "type": EventType.custom.rawValue,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "metadata": merged,
+        ]
+        queue.enqueue(
+            endpoint: "\(apiUrl)/api/v1/mobile/event",
+            payload: [
+                "campaign_id": campaignId,
+                "device_id": deviceId,
+                "events": [event],
+            ]
+        )
+    }
+
+    /// Wipe the device identity. Drains pending events first (they land
+    /// server-side under the OLD device_id which is correct), then clears
+    /// the queue, regenerates the device_id, and resets state. Call on
+    /// app logout when a different user might sign in afterwards
+    /// (shared family iPad, kiosk app). Without this, the next user's
+    /// actions get merged into the previous user's funnel.
+    public func reset() {
         Task {
-            try? await client.sendEvents(
-                campaignId: campaignId,
-                deviceId: deviceId,
-                events: [MobileEvent(type: .custom, metadata: merged)]
-            )
+            await queue.flush()
+            queue.clear()
+            // Reset the on-disk device_id cache so getStableDeviceId
+            // mints a fresh one. The platform IDFV is tied to the
+            // bundle and we can't change it; only the UUID fallback
+            // (when IDFV unavailable) gets fresh entropy.
+            // Key must match the one DeviceId.swift writes to. Earlier
+            // versions used "affiliateo_device_id_fallback" here which
+            // was a no-op since DeviceId.swift actually stores under
+            // "com.affiliateo.device_id".
+            UserDefaults.standard.removeObject(forKey: "com.affiliateo.device_id")
+            self.deviceId = getStableDeviceId()
+            await MainActor.run {
+                self.state = AffiliateoState(
+                    refCode: nil,
+                    isMatched: false,
+                    isLoading: false,
+                    visitorId: nil,
+                    appAccountToken: nil
+                )
+            }
         }
+    }
+
+    /// Stop tracking on this device. Sets the persistent opt-out flag
+    /// in UserDefaults and silences ALL subsequent page / track /
+    /// identify calls until optIn() is called. Survives app restart.
+    /// Pending queued events are dropped — the visitor explicitly said
+    /// no, sending events captured before the decision would still
+    /// violate consent. Use for GDPR/CCPA "Don't track me" consent.
+    public func optOut() {
+        isOptedOut = true
+        UserDefaults.standard.set("true", forKey: AffiliateoManager.optOutKey)
+        queue.clear()
+    }
+
+    /// Re-enable tracking after a previous optOut(). The auto session
+    /// start that fires on provider mount won't retroactively replay —
+    /// to resume immediately the host should reinitialize the manager
+    /// (e.g. tear down and re-create AffiliateoProvider).
+    public func optIn() {
+        isOptedOut = false
+        UserDefaults.standard.removeObject(forKey: AffiliateoManager.optOutKey)
+    }
+
+    /// Force-drain the event queue immediately. Useful before a known
+    /// unrecoverable transition (entering an in-app purchase flow,
+    /// app about to be backgrounded for a long time). Best-effort: if
+    /// offline the flush noops and events stay queued for the next
+    /// retry cycle.
+    public func flush() async {
+        await queue.flush()
     }
 
     /// Link this anonymous device install to a merchant user_id so the
@@ -148,14 +267,6 @@ public final class AffiliateoManager: ObservableObject {
                 userId: cleanId
             )
         }
-    }
-
-    private func sendScreenView(screen: String, metadata: [String: Any]? = nil) async {
-        try? await client.sendEvents(
-            campaignId: campaignId,
-            deviceId: deviceId,
-            events: [MobileEvent(type: .screenView, screen: screen, metadata: metadata)]
-        )
     }
 
     private func identify() async {
@@ -249,17 +360,30 @@ public final class AffiliateoManager: ObservableObject {
     }
 
     @objc private func appDidBecomeActive() {
-        Task {
-            try? await client.sendEvents(
-                campaignId: campaignId,
-                deviceId: deviceId,
-                events: [MobileEvent(type: .sessionStart)]
-            )
-        }
+        if isOptedOut { return }
+        // Route through the queue so foreground pings survive a flaky
+        // network the way regular page/track events do. The server's
+        // start_mobile_session RPC is idempotent so a duplicate from a
+        // queue retry just no-ops.
+        let event: [String: Any] = [
+            "type": EventType.sessionStart.rawValue,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+        ]
+        queue.enqueue(
+            endpoint: "\(apiUrl)/api/v1/mobile/event",
+            payload: [
+                "campaign_id": campaignId,
+                "device_id": deviceId,
+                "events": [event],
+            ]
+        )
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        // Persist any in-flight queue state and stop background timers.
+        // Anything still queued stays on disk for the next launch.
+        queue.shutdown()
     }
 }
 
@@ -285,5 +409,73 @@ public enum Affiliateo {
     /// the full doc.
     public static func identify(_ userId: String) {
         AffiliateoManager.shared?.identify(userId)
+    }
+
+    /// Wipe the device identity. Call on app logout when a different
+    /// person might use this device afterwards. See
+    /// `AffiliateoManager.reset` for full doc.
+    public static func reset() {
+        AffiliateoManager.shared?.reset()
+    }
+
+    /// Stop tracking on this device. Persistent across app restarts.
+    /// Use for GDPR/CCPA "Don't track me" consent.
+    public static func optOut() {
+        AffiliateoManager.shared?.optOut()
+    }
+
+    /// Re-enable tracking after a previous optOut(). Host should
+    /// reinitialize the provider to fully resume.
+    public static func optIn() {
+        AffiliateoManager.shared?.optIn()
+    }
+
+    /// Force-drain the event queue immediately. Best-effort. See
+    /// `AffiliateoManager.flush` for full doc.
+    public static func flush() async {
+        await AffiliateoManager.shared?.flush()
+    }
+}
+
+// MARK: - SwiftUI screen helper
+
+/// One-line screen tracking modifier. Replaces the old pattern of:
+///   ContentView()
+///       .onAppear { Affiliateo.page("HomeScreen") }
+///
+/// With:
+///   ContentView()
+///       .trackedScreen("HomeScreen")
+///
+/// Mirrors @affiliateo/react-native's useAffiliateoScreen hook and
+/// Datafast's useDataFastScreen hook. The metadata closure is fired
+/// lazily so a screen that builds metadata from runtime state (a user
+/// tier, an A/B variant) doesn't pay the cost on every render.
+public extension View {
+    /// Fire a screen_view event when this view first appears.
+    /// Idempotent across re-renders: only the first `.onAppear` call
+    /// per view instance fires.
+    func trackedScreen(_ screenName: String, metadata: [String: Any]? = nil) -> some View {
+        modifier(TrackedScreenModifier(screenName: screenName, metadata: metadata))
+    }
+}
+
+private struct TrackedScreenModifier: ViewModifier {
+    let screenName: String
+    let metadata: [String: Any]?
+    // Track-fired flag scoped to the view instance so re-renders don't
+    // re-fire. SwiftUI's @State semantics make this stable across body
+    // recomputations but reset on view-identity changes (e.g. NavigationStack
+    // pushing a fresh screen of the same type, which is correctly counted
+    // as a separate visit).
+    @State private var fired = false
+
+    func body(content: Content) -> some View {
+        content.onAppear {
+            if !fired {
+                fired = true
+                Affiliateo.page(screenName, metadata: metadata)
+            }
+        }
     }
 }
